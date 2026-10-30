@@ -104,7 +104,10 @@ FP4_DTYPE = torch.uint8
 logger = init_logger(__name__)
 
 trtllm_workspace_buffer = None
-trtllm_multi_ctas_kv_counter_buffer: torch.Tensor | None = None
+# Separate buffers for the context (prefill) and decode kernels: in a mixed step
+# they run back to back, and with PDL the second may start before the first has
+# reset its counters.
+trtllm_multi_ctas_kv_counter_buffers: dict[str, torch.Tensor] = {}
 
 
 def _nvfp4_kv_on_fa2() -> bool:
@@ -146,20 +149,21 @@ def _get_trtllm_workspace_buffer():
     return trtllm_workspace_buffer
 
 
-def _reserve_trtllm_multi_ctas_kv_counter_buffer(num_bytes: int) -> None:
-    """Make the shared trtllm-gen multi-CTA KV counter buffer hold num_bytes.
+def _reserve_trtllm_multi_ctas_kv_counter_buffers(num_bytes: int) -> None:
+    """Make the shared trtllm-gen multi-CTA KV counter buffers hold num_bytes.
 
-    Without it FlashInfer allocates and zero-fills a fresh counter buffer on
+    Without them FlashInfer allocates and zero-fills a fresh counter buffer on
     every attention call (one extra kernel per layer per step). The kernels
-    reset their counters before returning, so one zeroed buffer can be shared
-    by all layers. Called at layer init, never during CUDA graph capture.
+    reset their counters before returning, so one zeroed buffer per kernel kind
+    can be shared by all layers. Called at layer init, never during CUDA graph
+    capture.
     """
-    global trtllm_multi_ctas_kv_counter_buffer
-    buf = trtllm_multi_ctas_kv_counter_buffer
-    if buf is None or buf.numel() < num_bytes:
-        trtllm_multi_ctas_kv_counter_buffer = torch.zeros(
-            num_bytes, dtype=torch.uint8, device="cuda"
-        )
+    for kind in ("prefill", "decode"):
+        buf = trtllm_multi_ctas_kv_counter_buffers.get(kind)
+        if buf is None or buf.numel() < num_bytes:
+            trtllm_multi_ctas_kv_counter_buffers[kind] = torch.zeros(
+                num_bytes, dtype=torch.uint8, device="cuda"
+            )
 
 
 def _pack_draft_block_bool_mask(
@@ -1942,7 +1946,7 @@ class FlashInferImpl(AttentionImpl):
 
             # every request in a batch has >= 1 token, so this bounds decode,
             # prefill and padded CUDA graph capture batches alike
-            _reserve_trtllm_multi_ctas_kv_counter_buffer(
+            _reserve_trtllm_multi_ctas_kv_counter_buffers(
                 get_trtllm_gen_multi_ctas_kv_counter_bytes(
                     vllm_config.scheduler_config.max_num_batched_tokens,
                     num_heads,
@@ -2407,7 +2411,9 @@ class FlashInferImpl(AttentionImpl):
                     o_sf_scale=self.o_sf_scale,
                     out=out,
                     kv_cache_sf=prefill_kv_block_scales,
-                    multi_ctas_kv_counter_buffer=trtllm_multi_ctas_kv_counter_buffer,
+                    multi_ctas_kv_counter_buffer=trtllm_multi_ctas_kv_counter_buffers.get(
+                        "prefill"
+                    ),
                 )
 
                 if needs_fp8_out:
@@ -2636,7 +2642,9 @@ class FlashInferImpl(AttentionImpl):
                     lse=lse,
                     return_lse=self.need_to_return_lse_for_decode,
                     multi_ctas_kv_counter_buffer=(
-                        None if decode_with_xqa else trtllm_multi_ctas_kv_counter_buffer
+                        None
+                        if decode_with_xqa
+                        else trtllm_multi_ctas_kv_counter_buffers.get("decode")
                     ),
                 )
 
