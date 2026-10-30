@@ -224,6 +224,86 @@ direct_register_custom_op(
 )
 
 
+# tinygemm2 covers the batch dimension with a single 8-row tile; beyond that cuBLAS wins.
+_TINYGEMM_MAX_TOKENS = 8
+# It parallelizes over output tiles only, so it wins where cuBLAS falls back to
+# split-K + a separate reduce kernel (narrow outputs) and loses on wide ones. On
+# B200, gpt-oss: router 128x2880 4.9->3.0us, o_proj 2880x4096 7.7->6.9us, but
+# qkv 5120x2880 7.1->8.2us (bench/scripts/microbench_linear.py).
+_TINYGEMM_MAX_N = 4096
+
+
+def _can_use_flashinfer_tinygemm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> bool:
+    k = x.shape[-1]
+    return (
+        x.numel() // max(k, 1) <= _TINYGEMM_MAX_TOKENS
+        and x.numel() > 0
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and weight.shape[1] == k
+        and k % 64 == 0
+        and weight.shape[0] % 16 == 0
+        and weight.shape[0] <= _TINYGEMM_MAX_N
+        and (
+            bias is None
+            or (
+                bias.dtype == torch.bfloat16
+                and bias.is_contiguous()
+                and bias.shape == (weight.shape[0],)
+            )
+        )
+    )
+
+
+def cuda_flashinfer_tinygemm_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    # Dispatched at run time (custom op): decode CUDA graphs are captured per
+    # batch size, piecewise/eager prefill sees its real token count.
+    if not _can_use_flashinfer_tinygemm(x, weight, bias):
+        return torch.nn.functional.linear(x, weight, bias)
+    from flashinfer.gemm import tinygemm_bf16
+
+    k = x.shape[-1]
+    n = weight.shape[0]
+    x_2d = x.view(-1, k)
+    out = torch.empty((x_2d.shape[0], n), dtype=x.dtype, device=x.device)
+    tinygemm_bf16(x_2d, weight, out, bias=bias)
+    return out.view(*x.shape[:-1], n)
+
+
+def cuda_flashinfer_tinygemm_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+
+
+def cuda_flashinfer_tinygemm(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.ops.vllm.cuda_flashinfer_tinygemm(x, weight, bias)
+
+
+direct_register_custom_op(
+    op_name="cuda_flashinfer_tinygemm",
+    op_func=cuda_flashinfer_tinygemm_impl,
+    fake_impl=cuda_flashinfer_tinygemm_fake,
+)
+
+
 def use_aiter_triton_gemm(n, m, k, dtype):
     if (
         not rocm_aiter_ops.is_triton_gemm_enabled()
@@ -625,6 +705,20 @@ def dispatch_unquantized_gemm(
     elif current_platform.is_cpu():
         return cpu_unquantized_gemm
     elif not current_platform.is_cuda():
+        return default_unquantized_gemm
+
+    if linear_backend == "flashinfer_tinygemm":
+        if current_platform.has_device_capability(90):
+            logger.info_once(
+                "Using FlashInfer tinygemm2 for unquantized BF16 GEMMs with "
+                "<= %d tokens.",
+                _TINYGEMM_MAX_TOKENS,
+            )
+            return cuda_flashinfer_tinygemm
+        logger.warning_once(
+            "--linear-backend=flashinfer_tinygemm needs SM90+; using "
+            "automatic selection for unquantized linear layers."
+        )
         return default_unquantized_gemm
 
     backend_spec = _FLASHINFER_BF16_BACKENDS.get(linear_backend)
