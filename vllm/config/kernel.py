@@ -246,6 +246,7 @@ LinearBackend = Literal[
     "cutlass",
     "flashinfer_cutlass",
     "flashinfer_cutedsl",
+    "flashinfer_tinygemm",
     "flashinfer_trtllm",
     "flashinfer_cudnn",
     "flashinfer_b12x",
@@ -358,6 +359,9 @@ class KernelConfig:
     - "flashinfer_cutlass": Use FlashInfer with CUTLASS kernels
     - "flashinfer_cutedsl": Use FlashInfer with CuTe-DSL kernels
       (BF16, NVFP4, MXFP8, W4A16_NVFP4)
+    - "flashinfer_tinygemm": Use FlashInfer's latency-optimized tinygemm2 for
+      unquantized BF16 GEMMs with at most 8 tokens and at most 4096 outputs
+      (decode-time router/o_proj), cuBLAS otherwise
     - "flashinfer_trtllm": Use FlashInfer with TensorRT-LLM kernels
     - "flashinfer_cudnn": Use FlashInfer with cuDNN kernels
     - "flashinfer_b12x": Use FlashInfer b12x CuteDSL NVFP4 GEMM (SM120+)
