@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import datetime
+import functools
 from collections.abc import Sequence
 from typing import Any
 
@@ -472,12 +473,12 @@ def _use_legacy_tool_call_headers(token_ids: list[int]) -> list[int]:
     GPT-OSS can echo the latter as a malformed header with the recipient in
     both positions. Rewrite only that unambiguous token-level header shape,
     while retaining oss-harmony's embedded vocabulary and parser.
+
+    This runs over every earlier tool call of the conversation on every
+    request, so decodes and rewritten headers are memoized (agent loops reuse a
+    handful of tools).
     """
-    encoding = get_encoding()
-    start = encoding.encode("<|start|>", allowed_special="all")[0]
-    channel_token = encoding.encode("<|channel|>", allowed_special="all")[0]
-    constrain = encoding.encode("<|constrain|>", allowed_special="all")[0]
-    message = encoding.encode("<|message|>", allowed_special="all")[0]
+    start, channel_token, constrain, message = _header_special_tokens()
 
     result = token_ids.copy()
     index = 0
@@ -494,11 +495,11 @@ def _use_legacy_tool_call_headers(token_ids: list[int]) -> list[int]:
             index += 1
             continue
 
-        author = encoding.decode(result[index + 1 : channel_index])
-        channel_and_recipient = encoding.decode(
-            result[channel_index + 1 : constrain_index]
+        author = _decode_cached(tuple(result[index + 1 : channel_index]))
+        channel_and_recipient = _decode_cached(
+            tuple(result[channel_index + 1 : constrain_index])
         )
-        content_type = encoding.decode(result[constrain_index + 1 : header_end])
+        content_type = _decode_cached(tuple(result[constrain_index + 1 : header_end]))
         if (
             author != "assistant"
             or " to=" not in channel_and_recipient
@@ -512,17 +513,44 @@ def _use_legacy_tool_call_headers(token_ids: list[int]) -> list[int]:
             index = header_end + 1
             continue
 
-        legacy_header = (
-            [start]
-            + encoding.encode(f"assistant to={recipient}")
-            + [channel_token]
-            + encoding.encode(f"{channel} {content_type}")
-            + [message]
-        )
+        legacy_header = _legacy_tool_call_header(recipient, channel, content_type)
         result[index : header_end + 1] = legacy_header
         index += len(legacy_header)
 
     return result
+
+
+@functools.cache
+def _header_special_tokens() -> tuple[int, int, int, int]:
+    encoding = get_encoding()
+    return tuple(  # type: ignore[return-value]
+        encoding.encode(t, allowed_special="all")[0]
+        for t in ("<|start|>", "<|channel|>", "<|constrain|>", "<|message|>")
+    )
+
+
+@functools.lru_cache(maxsize=4096)
+def _decode_cached(token_ids: tuple[int, ...]) -> str:
+    return get_encoding().decode(list(token_ids))
+
+
+@functools.lru_cache(maxsize=4096)
+def _legacy_tool_call_header(
+    recipient: str, channel: str, content_type: str
+) -> list[int]:
+    # The parts were decoded from ordinary tokens. disallowed_special=() skips
+    # openai_harmony's special-token check, which rebuilds and runs a regex
+    # over the whole special-token vocabulary on every encode() call; the
+    # token ids are the same. Callers splice the returned list, never mutate it.
+    encoding = get_encoding()
+    start, channel_token, _, message = _header_special_tokens()
+    return (
+        [start]
+        + encoding.encode(f"assistant to={recipient}", disallowed_special=())
+        + [channel_token]
+        + encoding.encode(f"{channel} {content_type}", disallowed_special=())
+        + [message]
+    )
 
 
 def get_streamable_parser_for_assistant() -> StreamableParser:
