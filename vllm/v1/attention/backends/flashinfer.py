@@ -66,6 +66,7 @@ from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
     AttentionImpl,
+    AttentionLayer,
     AttentionMetadataBuilder,
     AttentionType,
     CommonAttentionMetadata,
@@ -2619,6 +2620,65 @@ class FlashInferImpl(AttentionImpl):
                 elif needs_fp8_out:
                     output[:num_decode_tokens].copy_(out)
         return output_padded
+
+    def fused_rope_kvcache_supported(self):
+        # RopeKVCacheFusionPass: one Triton kernel for RoPE + KV-cache write,
+        # unquantized caches only.
+        return (
+            current_platform.is_cuda()
+            and self.kv_sharing_target_layer_name is None
+            and not is_quantized_kv_cache(self.kv_cache_dtype)
+            and not self.is_kvcache_nvfp4
+            and not self.nvfp4_fa2
+        )
+
+    def do_rope_and_kv_cache_update(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        is_neox: bool,
+        kv_cache: torch.Tensor,
+        layer_slot_mapping: torch.Tensor,
+    ):
+        from vllm.v1.attention.ops.triton_rope_reshape_and_cache import (
+            can_rope_reshape_and_cache,
+            rope_reshape_and_cache,
+        )
+
+        # (B, H, N, 2*hs) -> ((B, N, H, hs), (B, N, H, hs))
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        if can_rope_reshape_and_cache(query, key, value, cos_sin_cache, key_cache):
+            rope_reshape_and_cache(
+                query,
+                key,
+                value,
+                positions,
+                cos_sin_cache,
+                is_neox,
+                key_cache,
+                value_cache,
+                layer_slot_mapping,
+            )
+            return
+        # Unsupported shape: the unfused ops.
+        from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+
+        rot_q, rot_k = RotaryEmbedding.forward_static(
+            positions,
+            query,
+            key,
+            self.head_size,
+            cos_sin_cache.shape[-1],
+            cos_sin_cache,
+            is_neox,
+        )
+        query.copy_(rot_q)
+        key.copy_(rot_k)
+        self.do_kv_cache_update(layer, key, value, kv_cache, layer_slot_mapping)
 
     def do_kv_cache_update(
         self,
