@@ -3,6 +3,8 @@
 
 import datetime
 import functools
+import threading
+from collections import OrderedDict
 from collections.abc import Sequence
 from typing import Any
 
@@ -15,6 +17,7 @@ from openai_harmony import (
     Message,
     ReasoningEffort,
     RenderConversationConfig,
+    RenderOptions,
     Role,
     StreamableParser,
     SystemContent,
@@ -448,15 +451,72 @@ def parse_chat_input_to_harmony_message(
 
 
 def render_for_completion(messages: list[Message]) -> list[int]:
+    """Render a conversation plus the assistant completion header.
+
+    Equivalent to ``render_conversation_for_completion`` (the conversation is
+    the concatenation of its independently rendered messages), but each
+    message's tokens are memoized: an agent loop resends its whole growing
+    conversation every turn, and re-tokenizing it cost ~30 ms per request at
+    45K tokens.
+    """
     messages = auto_drop_analysis_messages(messages)
-    conversation = Conversation.from_messages(messages)
     encoding = get_encoding()
-    token_ids = encoding.render_conversation_for_completion(
-        conversation,
-        Role.ASSISTANT,
-        config=RenderConversationConfig(auto_drop_analysis=False),
+    options = RenderOptions(
+        conversation_has_function_tools=_has_function_tools(messages)
     )
+    token_ids: list[int] = []
+    for message in messages:
+        token_ids.extend(_render_message_cached(encoding, message, options))
+    token_ids.extend(_completion_header())
     return _use_legacy_tool_call_headers(token_ids)
+
+
+def _has_function_tools(messages: list[Message]) -> bool:
+    # Mirrors oss-harmony's conversation-level check; it changes how messages
+    # addressed to functions.* are rendered.
+    return any(
+        message.author.role == Role.DEVELOPER
+        and any(
+            isinstance(content, DeveloperContent)
+            and content.tools is not None
+            and "functions" in content.tools
+            for content in message.content
+        )
+        for message in messages
+    )
+
+
+@functools.cache
+def _completion_header() -> tuple[int, ...]:
+    return tuple(
+        get_encoding().render_conversation_for_completion(
+            Conversation.from_messages([]),
+            Role.ASSISTANT,
+            config=RenderConversationConfig(auto_drop_analysis=False),
+        )
+    )
+
+
+_RENDER_CACHE_SIZE = 65536
+_render_cache: OrderedDict[tuple[str, bool], list[int]] = OrderedDict()
+_render_cache_lock = threading.Lock()
+
+
+def _render_message_cached(
+    encoding, message: Message, options: RenderOptions
+) -> list[int]:
+    key = (message.to_json(), options.conversation_has_function_tools)
+    with _render_cache_lock:
+        token_ids = _render_cache.get(key)
+        if token_ids is not None:
+            _render_cache.move_to_end(key)
+            return token_ids
+    token_ids = encoding.render(message, options)
+    with _render_cache_lock:
+        _render_cache[key] = token_ids
+        if len(_render_cache) > _RENDER_CACHE_SIZE:
+            _render_cache.popitem(last=False)
+    return token_ids
 
 
 def _use_legacy_tool_call_headers(token_ids: list[int]) -> list[int]:
