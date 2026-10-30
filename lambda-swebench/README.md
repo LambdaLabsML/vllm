@@ -22,3 +22,8 @@ Serving flags (speculative decoding; exact sampling, the target verifies every t
 The draft head is nvidia/gpt-oss-120b-Eagle3-v3 with its lm_head cut to 32,768 rows (tokens seen in held-out
 gpt-oss outputs + all special tokens; bench/scripts/make_draft_vocab_head.py). Replay vs v0.32.0: TPOT -42.5%,
 end-to-end request time -26% (spec decode alone).
+
+Live OpenCode SWE-bench runs (8 replicas, 32 concurrent tasks), stack + EAGLE3 vs v0.32.0:
+- sub50: 30/50 resolved (baseline 32/50, within noise); TTFT p50/p95 384/1059 -> 162/693 ms; TPOT p50/p95
+  3.60/7.08 -> 2.05/4.96 ms; tasks/hour 65 -> 98; GPU-hours per resolved task 0.192 -> 0.136.
+- sub20: TTFT p50/p95 255/846 -> 134/625 ms; TPOT p50/p95 3.23/5.29 -> 1.88/3.55 ms; tasks/hour 42 -> 58.
