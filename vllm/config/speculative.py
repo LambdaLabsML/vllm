@@ -454,6 +454,11 @@ class SpeculativeConfig:
     speculative methods. This is an experimental option for measuring the
     acceptance-rate impact of reusing that block. It does not disable the
     speculative drafter itself."""
+    draft_vocab_path: str | None = None
+    """MTP only: path to a JSON list of target token ids. The drafter computes
+    logits for these tokens only (a contiguous slice of the shared lm_head)
+    and never proposes other tokens. Lossless: the target verifies every
+    draft token; only the acceptance rate can change."""
     use_local_argmax_reduction: bool = False
     """Use vocab-parallel local argmax instead of all-gathering full logits
     for draft token generation. Reduces communication from O(vocab_size) to

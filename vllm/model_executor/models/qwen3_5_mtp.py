@@ -247,10 +247,22 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        # Set by set_draft_vocab: target token ids the drafter may propose and
+        # the matching lm_head rows.
+        self.draft_token_ids: torch.Tensor | None = None
+        self.draft_lm_weight: torch.Tensor | None = None
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+
+    def set_draft_vocab(self, token_ids: torch.Tensor) -> None:
+        """Restrict draft logits to ``token_ids``. Call after the lm_head
+        weights are final (loaded or shared with the target)."""
+        weight = self.lm_head.weight
+        assert self.lm_head.tp_size == 1, "draft vocabulary needs TP=1"
+        self.draft_token_ids = token_ids.to(weight.device)
+        self.draft_lm_weight = weight.index_select(0, self.draft_token_ids)
 
     def embed_input_ids(
         self,
@@ -297,7 +309,16 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        if self.draft_lm_weight is None:
+            return self.logits_processor(self.lm_head, hidden_states)
+        # Reads |draft vocab| lm_head rows instead of the full vocabulary;
+        # tokens outside the draft vocabulary get zero draft probability.
+        draft_logits = nn.functional.linear(hidden_states, self.draft_lm_weight)
+        logits = draft_logits.new_full(
+            (hidden_states.shape[0], self.config.vocab_size), float("-inf")
+        )
+        logits[:, self.draft_token_ids] = draft_logits
+        return logits
 
     def is_unused_checkpoint_weight(self, name: str) -> bool:
         return not name.startswith("mtp.") and not any(

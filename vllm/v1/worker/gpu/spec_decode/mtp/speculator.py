@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+
+import torch
 import torch.nn as nn
 
+from vllm.logger import init_logger
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
     TargetDependentARSpeculator,
 )
+
+logger = init_logger(__name__)
 
 
 class MTPSpeculator(TargetDependentARSpeculator):
@@ -33,6 +39,18 @@ class MTPSpeculator(TargetDependentARSpeculator):
             and hasattr(draft_model.model, "set_skip_topk")
             and hasattr(draft_model.model, "compact_topk_indices")
         )
+        vocab_path = spec_config.draft_vocab_path if spec_config is not None else None
+        if vocab_path:
+            if not hasattr(draft_model, "set_draft_vocab"):
+                raise ValueError(
+                    f"{type(draft_model).__name__} does not support draft_vocab_path"
+                )
+            with open(vocab_path) as f:
+                token_ids = torch.tensor(sorted(set(json.load(f))), dtype=torch.long)
+            draft_model.set_draft_vocab(token_ids)
+            logger.info(
+                "MTP draft vocabulary: %d tokens from %s", len(token_ids), vocab_path
+            )
         return draft_model
 
     def on_prefill_begin(self, num_reqs: int) -> None:
