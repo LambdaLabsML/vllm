@@ -63,6 +63,7 @@ from .inputs import (
 )
 from .inputs.preprocess import extract_target_prompt
 from .params import ChatParams, TokenizeParams
+from .segment_token_cache import SegmentTokenCache
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -625,6 +626,13 @@ class BaseRenderer(ABC, Generic[_T]):
 
         return prompt
 
+    @cached_property
+    def _segment_token_cache(self) -> SegmentTokenCache | None:
+        if self.tokenizer is None:
+            return None
+        cache = SegmentTokenCache(self.tokenizer)
+        return cache if cache.enabled else None
+
     def _tokenize_prompt(
         self,
         prompt: TextPrompt,
@@ -633,6 +641,18 @@ class BaseRenderer(ABC, Generic[_T]):
         tokenizer = self.get_tokenizer()
         want_offsets = self._wants_offsets(prompt, params)
         kwargs = params.get_encode_kwargs()
+        if not want_offsets and not kwargs.get("add_special_tokens", True):
+            seg_cache = self._segment_token_cache
+            if seg_cache is not None:
+                token_ids = seg_cache.encode(prompt["prompt"])
+                max_length = kwargs.get("max_length")
+                # Anything the tokenizer would truncate goes the normal way.
+                if (
+                    not kwargs.get("truncation")
+                    or max_length is None
+                    or len(token_ids) <= max_length
+                ):
+                    return self._build_tokens_prompt(token_ids, prompt)
         if want_offsets:
             kwargs = {**kwargs, "return_offsets_mapping": True}
         encoding = tokenizer(prompt["prompt"], **kwargs)
