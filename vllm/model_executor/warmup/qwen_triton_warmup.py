@@ -237,6 +237,7 @@ def _warm_fused_post_conv_kernel(
 def _warm_fused_sigmoid_gating_delta_rule_update_kernel(
     device: torch.device,
     config: _QwenGDNWarmupConfig,
+    num_spec_tokens: int = 0,
 ) -> None:
     from vllm.third_party.flash_linear_attention.ops.fused_sigmoid_gating import (
         fused_sigmoid_gating_delta_rule_update,
@@ -274,6 +275,41 @@ def _warm_fused_sigmoid_gating_delta_rule_update_kernel(
         is_kda=False,
     )
 
+    # Spec decoding: the multi-token update with num_accepted_tokens and a
+    # [num_spec_decodes, 1 + num_spec_tokens] state-index table is a separate
+    # specialization; N == 1 and N > 1 compile separately as well.
+    if num_spec_tokens > 0:
+        query_len = num_spec_tokens + 1
+        for num_seqs in (1, 2):
+            t = num_seqs * query_len
+            q = torch.empty((1, t, config.h, config.k), dtype=config.conv_dtype, device=device)
+            v = torch.empty((1, t, config.hv, config.v), dtype=config.conv_dtype, device=device)
+            a = torch.empty((1, t, config.hv), dtype=config.conv_dtype, device=device)
+            fused_sigmoid_gating_delta_rule_update(
+                A_log=config.a_log,
+                a=a,
+                b=torch.empty_like(a),
+                dt_bias=config.dt_bias,
+                q=q,
+                k=torch.empty_like(q),
+                v=v,
+                beta=1.0,
+                threshold=20.0,
+                initial_state=state,
+                inplace_final_state=True,
+                cu_seqlens=torch.arange(
+                    0, t + 1, query_len, dtype=torch.int32, device=device
+                ),
+                ssm_state_indices=torch.zeros(
+                    (num_seqs, query_len), dtype=torch.int32, device=device
+                ),
+                num_accepted_tokens=torch.ones(
+                    num_seqs, dtype=torch.int32, device=device
+                ),
+                use_qk_l2norm_in_kernel=True,
+                is_kda=False,
+            )
+
 
 def _synchronize_device(device: torch.device) -> None:
     if device.type == "cuda":
@@ -307,5 +343,12 @@ def qwen_triton_warmup(
     _warm_fused_post_conv_kernel(device, gdn_config)
     # Pooling only runs full prefills; the decode update kernel is unused.
     if not runner.is_pooling_model:
-        _warm_fused_sigmoid_gating_delta_rule_update_kernel(device, gdn_config)
+        spec_config = runner.vllm_config.speculative_config
+        _warm_fused_sigmoid_gating_delta_rule_update_kernel(
+            device,
+            gdn_config,
+            num_spec_tokens=(
+                spec_config.num_speculative_tokens if spec_config is not None else 0
+            ),
+        )
     _synchronize_device(device)

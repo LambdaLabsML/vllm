@@ -467,6 +467,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
                 with self.jit_warmup_registry.activate():
                     register_top_k_top_p_warmups()
+            elif current_platform.is_cuda():
+                # The split top-p kernels sample batches of <= 64 logits rows,
+                # i.e. every decode step of a lightly loaded server, and their
+                # split count S (a constexpr) depends on the batch size. Unwarmed,
+                # each S variant JIT-compiles on the first requests after
+                # startup (seconds of TTFT). Only these three are registered:
+                # the full top-k/top-p set is what costs ~2 min per start.
+                from vllm.v1.sample.ops.topk_topp_triton import (
+                    _topp_split_mask,
+                    _topp_split_stats,
+                    _topp_split_step,
+                )
+
+                with self.jit_warmup_registry.activate():
+                    _topp_split_stats.register_warmup()
+                    _topp_split_step.register_warmup()
+                    _topp_split_mask.register_warmup()
 
             sampler_kwargs: dict[str, Any] = {
                 "vllm_config": self.vllm_config,

@@ -238,11 +238,34 @@ def warmup_kernels(
         rejection_sampler.enable_adaptive_verification = False
     try:
         _warmup_kernels(model_runner, worker_execute_model, worker_sample_tokens)
+        if model_runner.num_speculative_steps > 0 and not model_runner.is_pooling_model:
+            _warmup_gather_draft_sampled(model_runner.device)
     finally:
         model_runner.adaptive_verification = adaptive_verification
         if adaptive_sampling:
             assert rejection_sampler is not None
             rejection_sampler.enable_adaptive_verification = True
+
+
+def _warmup_gather_draft_sampled(device: torch.device) -> None:
+    """Compile the rejection sampler's draft gather for every num_logits
+    specialization (== 1, divisible by 16, other). Serving batches mix spec and
+    non-spec requests, so all three occur; the warmup steps above only produce
+    some of them."""
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
+        gather_draft_sampled,
+    )
+
+    for num_logits in (1, 7, 16):
+        indices = torch.zeros(num_logits, dtype=torch.int64, device=device)
+        gather_draft_sampled(
+            torch.zeros(num_logits, dtype=torch.int32, device=device),  # input_ids
+            torch.zeros(num_logits, dtype=torch.int64, device=device),  # positions
+            indices,  # logits_indices
+            indices,  # expanded_idx_mapping
+            torch.zeros(num_logits, dtype=torch.int32, device=device),  # local pos
+            torch.zeros(1, dtype=torch.int32, device=device),  # prefill_len
+        )
 
 
 def _warmup_kernels(
